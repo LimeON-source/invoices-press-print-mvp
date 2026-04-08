@@ -1,0 +1,12 @@
+pydantic>=2.0
+pytest
+python-docx
+docx2pdf
+num2words
+gspread
+google-auth
+fastapi
+uvicorn
+jinja2
+python-multipart
+openpyxl

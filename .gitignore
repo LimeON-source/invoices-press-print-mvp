@@ -1,0 +1,29 @@
+.venv/
+.venv-1/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+build/
+dist/
+.eggs/
+*.egg-info/
+.eggs
+pip-wheel-metadata/
+.python-version
+
+# editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# local files
+invoice_counter.json
+Invoices/
+.Context/**
+*.log
+pytest_cache/

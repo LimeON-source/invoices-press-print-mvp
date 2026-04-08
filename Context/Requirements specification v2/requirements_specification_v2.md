@@ -1,0 +1,125 @@
+# Requirements Specification v2: Invoices Press Print MVP
+
+## 1. Overview
+
+This document describes the complete invoice generation logic for the MVP app, including data input mappings, transformation rules, template replacement fields, folder structure, and extendable feature areas.
+
+- Project: Invoices Press Print
+- Language: Python (FastAPI backend)
+- Output: DOCX (with optional PDF conversion via docx2pdf)
+- Source data: CSV/XLSX sheet
+- UI: web form + CLI
+
+## 2. Entry points
+
+### 2.1 Web UI
+- route `/`: form with month, data source, template path, policy, selected clients
+- route `/generate`: handles form POST, builds invoices, returns status, output folder path
+- route `/open-folder`: opens local file system folder for generated invoices (macOS/Windows/Linux)
+
+### 2.2 CLI
+- `python -m src.invoice_app.main --month <month> --csv <file> --template <template> --policy <overwrite|skip|version>`
+- supports sheet-id / credentials for Google Sheets when needed.
+
+## 3. Data sources
+
+### 3.1 CSV loader
+- `load_clients_from_csv(path)` reads rows with csv.DictReader
+- uses first row as header keys
+
+### 3.2 XLSX loader
+- `load_clients_from_xlsx(path)` reads rows with openpyxl
+- sheet[0] is first worksheet
+- first row treated as headers
+
+### 3.3 Google Sheets loader (optional)
+- `load_clients_from_gsheet(sheet_id, credentials_path)` (not mandatory for MVP)
+
+## 4. Input field mapping (`prepare_invoice`)
+
+### 4.1 Client identification
+From input row:
+- `buyer_name` candidate order:
+  1. `row['Client']`
+  2. `row['Client Name']`
+  3. `row['Name Surname']`
+  4. second data column if still empty
+- skip row if empty or one of header markers: `"sesijų skaičius per mėnesį"`, `"viso"`, `"total"`, `"sum"`
+
+### 4.2 Address
+- `buyer_address`: row['Address'] or fallback `"N/A"`
+
+### 4.3 Rate
+- `rate`: row['Rate'] or row['Kaina'] (must be >0 numeric)
+
+### 4.4 Sessions quantity (amount) for month
+- `month_column` derived from user-selected month
+  - `normalize_month('kovas')` -> 3
+  - `month_number_to_column('kovas')` -> `'Kovas'`
+  - `month_to_folder('2026-03')` -> `'kovas'`
+- `sessions_val = row[month_column]` for the selected month
+- `sessions = int(float(sessions_val))` if >0
+- skip invoice if sessions == 0
+
+### 4.5 Calculated totals
+- `subtotal = sessions * rate`
+- `vat_amount = subtotal * vat_percent / 100` (from config)
+- `total = subtotal + vat_amount`
+- `total_words = num2words(total, lang='lt')` fallback to numeric via `convert_amount_to_words`
+
+## 5. Invoice model
+`InvoiceModel` includes:
+- number, date, seller (from config), buyer_name, buyer_address
+- sessions, rate, subtotal, vat_amount, total, total_words, line_item
+
+## 6. Template replacement plan
+`build_invoice` uses `fill_template(template_path, docx_path, replacements)`:
+- `<number>` -> invoice number
+- `<yyyy-mm-dd>` -> invoice date
+- `<suma zodziais>` -> total_words
+- `<client_name>`, `<Customer-name>`, `<customer-name>` -> buyer_name
+- `<client_address>`, `<Customer-address>`, `<customer-address>` -> buyer_address
+- `<kiekis>`, `<Kiekis>`, `<quantity>` -> sessions
+- `<kaina>`, `<rate>` -> rate formatted `00.00`
+- `<total>` -> total formatted `00.00`
+
+## 7. Output folder and naming
+- root folder from config `output_root` (default `Invoices`)
+- per-month child folder from `month_folder` (e.g., `vasaris`, `kovas`)
+- file name template: `{series}-{year}-{counter}_{sanitized_name}.pdf` or `.docx` fallback
+- `sanitize_filename` removes unsafe chars and replaces spaces with dashes
+
+## 8. Policy behavior
+- `overwrite`: replace existing output file
+- `skip`: leave existing file, no generation
+- `version`: appends `_v<number>` when file exists
+
+## 9. UI folder link (month path)
+- `Generate` returns `invoice_folder` to UI
+- UI displays `Invoices output folder for selected month` and link:
+  - text `Open folder for month: Invoices/<month_folder>`
+- `/open-folder?month=<month_folder>` opens same location
+
+## 10. Error handling and logging
+- rows with invalid user data are skipped and counted as errors
+- row parsing errors are logged with `Row error (row maybe has header/sum): <error msg>`
+- `stats` includes `processed`, `generated`, `skipped`, `errors`, `output_folder`
+
+## 11. Tests
+- `test_config_load`, `test_invoice_counter`, `test_convert_amount_to_words_fallback`
+- `test_process_batch_sets_output_folder_and_stats` (monkeypatch prepare/build)
+- `test_month_to_folder_mapping` (.xls name logic)
+- `test_build_invoice_includes_kiekis_replacement` (kiekis/kaina mapping)
+
+## 12. Future extension points
+1. add strong type-checking for source headers:
+   - header normalization map: `client`, `client_name`, `name surname`
+2. support unit tests for XLSX header variations and missing month column
+3. add PDF/A and digital signature option
+4. add per-client auto discount heuristics
+5. add upload and email delivery via SMTP/Gmail API
+6. ability to write summary report CSV for generated invoices
+
+---
+
+*Generated by project maintainer automation on 2026-03-29.*

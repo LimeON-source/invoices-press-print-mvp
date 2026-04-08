@@ -1,0 +1,13 @@
+{
+  "gdrive_folder": "./",
+  "seller": {
+    "name": "Šaknys ir sparnai MB",
+    "address": "123 Kaunas str, Klaipeda",
+    "company_code": "123456789",
+    "iban": "LT123456789012345678",
+    "issuer_name": "Vilma Krivickė"
+  },
+  "vat_percent": 0.0,
+  "invoice_series": "SS",
+  "output_root": "Invoices"
+}

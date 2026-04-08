@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Invoices Press Print</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 24px; max-width: 900px; margin: auto; }
+    .form-group { margin-bottom: 12px; }
+    label { display: block; margin-bottom: 4px; font-weight: bold; }
+    input[type=text], select, textarea { width: 100%; padding: 8px; border: 1px solid #d0d7de; border-radius: 4px; }
+    button { background: #2d8cf0; color: #fff; border: 0; padding: 10px 16px; border-radius: 4px; cursor: pointer; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+    td, th { border: 1px solid #d0d7de; padding: 8px; }
+    .status { padding: 12px; border: 1px solid #cce4ff; background: #e7f3ff; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+<h1>Invoices Press Print</h1>
+<p>Fill the form and click Generate.</p>
+<div class="form-group">
+  <label>Data source path</label>
+  <div>{{ data_source }}</div>
+</div>
+{% if message %}
+<div class="status">{{ message }} - {{ stats.processed }} processed / {{ stats.generated }} generated / {{ stats.errors }} errors</div>
+{% endif %}
+{% if invoice_folder %}
+<div class="form-group">
+  <label>Invoices output folder for selected month</label>
+  <div>{{ invoice_folder }}</div>
+  {% if invoice_month_folder %}
+  <div>Open folder for month: <strong>Invoices/{{ invoice_month_folder }}</strong></div>
+  <a href="/open-folder?month={{ invoice_month_folder | urlencode }}" class="button">Open output folder</a>
+  {% else %}
+  <a href="/open-folder?month={{ selected_month | urlencode }}" class="button">Open output folder</a>
+  {% endif %}
+</div>
+{% endif %}
+<form method="post" action="/generate">
+  <div class="form-group">
+    <label for="month">Month</label>
+    <select id="month" name="month">
+      {% for m in months %}
+      <option value="{{ m }}" {% if selected_month == m %}selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="form-group">
+    <label for="csv_path">Data source path</label>
+    <input type="text" id="csv_path" name="csv_path" value="{{ data_source }}" />
+  </div>
+  <div class="form-group">
+    <label for="template_path">Template DOCX</label>
+    <input type="text" id="template_path" name="template_path" value="Context/template saskaita-faktura.docx" />
+  </div>
+  <div class="form-group">
+    <label for="policy">Existing file policy</label>
+    <select id="policy" name="policy">
+      {% for p in policies %}
+      <option value="{{ p }}">{{ p }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="form-group">
+    <label for="selected">Selected client names (comma-separated)</label>
+    <input type="text" id="selected" name="selected" placeholder="John Doe, Jane Doe" />
+  </div>
+  <button type="submit">Generate</button>
+</form>
+</body>
+</html>
