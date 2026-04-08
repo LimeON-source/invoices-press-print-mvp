@@ -4,68 +4,175 @@
   <meta charset="UTF-8" />
   <title>Invoices Press Print</title>
   <style>
-    body { font-family: Arial, sans-serif; padding: 24px; max-width: 900px; margin: auto; }
-    .form-group { margin-bottom: 12px; }
-    label { display: block; margin-bottom: 4px; font-weight: bold; }
-    input[type=text], select, textarea { width: 100%; padding: 8px; border: 1px solid #d0d7de; border-radius: 4px; }
-    button { background: #2d8cf0; color: #fff; border: 0; padding: 10px 16px; border-radius: 4px; cursor: pointer; }
-    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
-    td, th { border: 1px solid #d0d7de; padding: 8px; }
-    .status { padding: 12px; border: 1px solid #cce4ff; background: #e7f3ff; margin-bottom: 16px; }
+    *, *::before, *::after { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; padding: 24px; max-width: 960px; margin: auto; background: #f6f8fa; color: #24292f; }
+    h1 { margin-bottom: 4px; }
+    p.subtitle { color: #57606a; margin-top: 0; margin-bottom: 20px; }
+
+    .card { background: #fff; border: 1px solid #d0d7de; border-radius: 6px; padding: 20px; margin-bottom: 20px; }
+
+    .form-group { margin-bottom: 14px; }
+    label { display: block; margin-bottom: 4px; font-weight: bold; font-size: 14px; }
+    input[type=text], select, textarea { width: 100%; padding: 8px 10px; border: 1px solid #d0d7de; border-radius: 4px; font-size: 14px; }
+    input[type=file] { font-size: 14px; }
+    .hint { font-size: 12px; color: #57606a; margin-top: 3px; }
+
+    .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+    button { padding: 9px 18px; border: 0; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold; }
+    .btn-primary { background: #2d8cf0; color: #fff; }
+    .btn-primary:hover { background: #1a7de0; }
+    .btn-secondary { background: #f0f0f0; color: #24292f; border: 1px solid #d0d7de; }
+    .btn-secondary:hover { background: #e0e0e0; }
+    a.btn-link { display: inline-block; padding: 9px 18px; background: #f0f0f0; border: 1px solid #d0d7de; border-radius: 4px; text-decoration: none; font-size: 14px; font-weight: bold; color: #24292f; }
+    a.btn-link:hover { background: #e0e0e0; }
+
+    /* Status / alerts */
+    .alert { padding: 12px 16px; border-radius: 4px; margin-bottom: 16px; font-size: 14px; }
+    .alert-success { background: #dafbe1; border: 1px solid #56d364; color: #1a7f37; }
+    .alert-error   { background: #ffebe9; border: 1px solid #ff818266; color: #cf222e; }
+    .alert-info    { background: #e7f3ff; border: 1px solid #cce4ff; color: #0550ae; }
+
+    /* Tables */
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th { background: #f6f8fa; text-align: left; }
+    td, th { border: 1px solid #d0d7de; padding: 8px 10px; }
+    tr.will-invoice { background: #fff; }
+    tr.no-invoice   { background: #f6f8fa; color: #8c8c8c; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 12px; font-weight: bold; }
+    .badge-yes { background: #dafbe1; color: #1a7f37; }
+    .badge-no  { background: #f0f0f0; color: #57606a; }
+
+    /* Output folder line */
+    .folder-line { font-size: 13px; color: #57606a; margin-top: 4px; }
   </style>
 </head>
 <body>
 <h1>Invoices Press Print</h1>
-<p>Fill the form and click Generate.</p>
-<div class="form-group">
-  <label>Data source path</label>
-  <div>{{ data_source }}</div>
-</div>
+<p class="subtitle">Generate PDF invoices from your client spreadsheet.</p>
+
+{% if error %}
+<div class="alert alert-error">⚠️ {{ error }}</div>
+{% endif %}
+
 {% if message %}
-<div class="status">{{ message }} - {{ stats.processed }} processed / {{ stats.generated }} generated / {{ stats.errors }} errors</div>
+<div class="alert alert-success">
+  ✅ {{ message }} —
+  <strong>{{ stats.generated }}</strong> generated,
+  <strong>{{ stats.skipped }}</strong> skipped,
+  <strong>{{ stats.errors }}</strong> errors.
+</div>
+{% if stats.error_details %}
+<div class="card">
+  <strong>Errors per client:</strong>
+  <table style="margin-top:10px;">
+    <thead><tr><th>Client</th><th>Reason</th></tr></thead>
+    <tbody>
+      {% for err in stats.error_details %}
+      <tr><td>{{ err.client }}</td><td>{{ err.reason }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
 {% endif %}
 {% if invoice_folder %}
-<div class="form-group">
-  <label>Invoices output folder for selected month</label>
-  <div>{{ invoice_folder }}</div>
+<div class="alert alert-info">
+  Output folder: <strong>{{ invoice_folder }}</strong>
+  &nbsp;
   {% if invoice_month_folder %}
-  <div>Open folder for month: <strong>Invoices/{{ invoice_month_folder }}</strong></div>
-  <a href="/open-folder?month={{ invoice_month_folder | urlencode }}" class="button">Open output folder</a>
+  <a href="/open-folder?month={{ invoice_month_folder | urlencode }}" class="btn-link">Open folder</a>
   {% else %}
-  <a href="/open-folder?month={{ selected_month | urlencode }}" class="button">Open output folder</a>
+  <a href="/open-folder?month={{ selected_month | urlencode }}" class="btn-link">Open folder</a>
   {% endif %}
 </div>
 {% endif %}
-<form method="post" action="/generate">
-  <div class="form-group">
-    <label for="month">Month</label>
-    <select id="month" name="month">
-      {% for m in months %}
-      <option value="{{ m }}" {% if selected_month == m %}selected{% endif %}>{{ m }}</option>
+{% endif %}
+
+{% if preview_rows %}
+<div class="card">
+  <strong>Preview for {{ preview_month }}</strong> — {{ preview_rows | selectattr("will_invoice") | list | length }} clients will be invoiced.
+  <table style="margin-top:12px;">
+    <thead>
+      <tr><th>Client</th><th>Sessions</th><th>Rate (€)</th><th>Total (€)</th><th>Invoice?</th></tr>
+    </thead>
+    <tbody>
+      {% for row in preview_rows %}
+      <tr class="{{ 'will-invoice' if row.will_invoice else 'no-invoice' }}">
+        <td>{{ row.name }}</td>
+        <td style="text-align:center;">{{ row.sessions }}</td>
+        <td style="text-align:right;">{{ row.rate }}</td>
+        <td style="text-align:right;">{{ row.total }}</td>
+        <td style="text-align:center;">
+          {% if row.will_invoice %}
+          <span class="badge badge-yes">Yes</span>
+          {% else %}
+          <span class="badge badge-no">No</span>
+          {% endif %}
+        </td>
+      </tr>
       {% endfor %}
-    </select>
-  </div>
-  <div class="form-group">
-    <label for="csv_path">Data source path</label>
-    <input type="text" id="csv_path" name="csv_path" value="{{ data_source }}" />
-  </div>
-  <div class="form-group">
-    <label for="template_path">Template DOCX</label>
-    <input type="text" id="template_path" name="template_path" value="Context/template saskaita-faktura.docx" />
-  </div>
-  <div class="form-group">
-    <label for="policy">Existing file policy</label>
-    <select id="policy" name="policy">
-      {% for p in policies %}
-      <option value="{{ p }}">{{ p }}</option>
-      {% endfor %}
-    </select>
-  </div>
-  <div class="form-group">
-    <label for="selected">Selected client names (comma-separated)</label>
-    <input type="text" id="selected" name="selected" placeholder="John Doe, Jane Doe" />
-  </div>
-  <button type="submit">Generate</button>
-</form>
+    </tbody>
+  </table>
+</div>
+{% endif %}
+
+<!-- Main form (shared by Preview and Generate) -->
+<div class="card">
+  <form method="post" action="/generate" enctype="multipart/form-data" id="mainForm">
+    <div class="form-group">
+      <label for="month">Month</label>
+      <select id="month" name="month">
+        {% for m in months %}
+        <option value="{{ m }}" {% if selected_month == m %}selected{% endif %}>{{ m }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label for="csv_path">Data source path</label>
+      <input type="text" id="csv_path" name="csv_path" value="{{ data_source }}" />
+      <div class="hint">Path to .xlsx or .csv file on disk — or upload a file below.</div>
+    </div>
+
+    <div class="form-group">
+      <label for="uploaded_file">Upload data file (optional)</label>
+      <input type="file" id="uploaded_file" name="uploaded_file" accept=".xlsx,.xls,.csv" />
+      <div class="hint">If a file is uploaded it takes priority over the path above.</div>
+    </div>
+
+    <div class="form-group">
+      <label for="template_path">Template DOCX</label>
+      <input type="text" id="template_path" name="template_path" value="Context/template saskaita-faktura.docx" />
+    </div>
+
+    <div class="form-group">
+      <label for="policy">Existing file policy</label>
+      <select id="policy" name="policy">
+        {% for p in policies %}
+        <option value="{{ p }}">{{ p }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="form-group">
+      <label for="selected">Filter clients (comma-separated, leave blank for all)</label>
+      <input type="text" id="selected" name="selected" placeholder="John Doe, Jane Doe" />
+    </div>
+
+    <div class="btn-row">
+      <button type="submit" class="btn-primary">Generate Invoices</button>
+      <button type="button" class="btn-secondary" onclick="submitPreview()">Preview</button>
+    </div>
+  </form>
+</div>
+
+<script>
+  function submitPreview() {
+    const form = document.getElementById('mainForm');
+    const orig = form.action;
+    form.action = '/preview';
+    form.submit();
+    form.action = orig;
+  }
+</script>
 </body>
 </html>

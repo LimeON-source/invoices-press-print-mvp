@@ -1,15 +1,12 @@
 import json
+import platform
 import re
+import subprocess
 import unicodedata
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Dict, List, Optional
-
-try:
-    from docx2pdf import convert as docx_to_pdf
-except ImportError:
-    docx_to_pdf = None
+from typing import Dict, List, Optional, Tuple
 
 try:
     from num2words import num2words
@@ -19,6 +16,10 @@ except ImportError:
 from invoice_app.models import AppConfig, InvoiceModel, LineItem, SellerConfig
 from invoice_app.template_filler import fill_template
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z\-_. ]", "", name).strip().replace(" ", "-")
@@ -57,23 +58,115 @@ def convert_amount_to_words(amount) -> str:
     return words
 
 
-def build_invoice(model: InvoiceModel, template_path: str, out_root: str, policy: str = "overwrite", month_folder: str = None) -> str:
-    if month_folder:
-        # Use the specified month folder (e.g., "vasaris")
-        dest_folder = Path(out_root) / month_folder
-    else:
-        # Fallback to date-based folder
-        year_month = model.date.strftime("%Y-%m")
-        dest_folder = Path(out_root) / year_month
+# ---------------------------------------------------------------------------
+# PDF conversion — batch, no per-file Word windows
+# ---------------------------------------------------------------------------
+
+def _libreoffice_path() -> Optional[str]:
+    """Return the soffice binary path if LibreOffice is installed."""
+    candidates = [
+        "soffice",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/usr/bin/soffice",
+        "/usr/local/bin/soffice",
+    ]
+    for c in candidates:
+        try:
+            result = subprocess.run([c, "--version"], capture_output=True, timeout=5)
+            if result.returncode == 0:
+                return c
+        except Exception:
+            continue
+    return None
+
+
+def batch_convert_to_pdf(docx_paths: List[Path], output_dir: Path) -> Dict[str, Optional[Path]]:
+    """
+    Convert a list of DOCX files to PDF as a single batch.
+    Returns a dict mapping docx_path -> pdf_path (or None if conversion failed).
+
+    Strategy:
+      1. LibreOffice headless  — silent, no UI, converts all files in one call
+      2. docx2pdf folder mode  — opens Word once for the whole folder
+      3. Fallback              — keep DOCX, return None for pdf_path
+    """
+    if not docx_paths:
+        return {}
+
+    results: Dict[str, Optional[Path]] = {}
+
+    # --- Strategy 1: LibreOffice headless -----------------------------------
+    soffice = _libreoffice_path()
+    if soffice:
+        try:
+            cmd = [
+                soffice,
+                "--headless",
+                "--convert-to", "pdf",
+                "--outdir", str(output_dir),
+            ] + [str(p) for p in docx_paths]
+            subprocess.run(cmd, capture_output=True, timeout=120)
+            for docx in docx_paths:
+                pdf = output_dir / (docx.stem + ".pdf")
+                results[str(docx)] = pdf if pdf.exists() else None
+            return results
+        except Exception:
+            pass  # fall through to next strategy
+
+    # --- Strategy 2: docx2pdf folder mode (one Word session) ----------------
+    try:
+        from docx2pdf import convert as _docx2pdf
+
+        # Move all target DOCX files into a temporary staging folder so we can
+        # convert exactly that folder — avoids touching unrelated DOCX files.
+        import tempfile, shutil
+        with tempfile.TemporaryDirectory() as stage_dir:
+            stage = Path(stage_dir)
+            # copy each docx into stage
+            for docx in docx_paths:
+                shutil.copy2(docx, stage / docx.name)
+            # one Word session converts the whole folder
+            _docx2pdf(str(stage) + "/", str(output_dir) + "/")
+            for docx in docx_paths:
+                pdf = output_dir / (docx.stem + ".pdf")
+                results[str(docx)] = pdf if pdf.exists() else None
+        return results
+    except Exception:
+        pass
+
+    # --- Strategy 3: fallback — keep DOCX -----------------------------------
+    for docx in docx_paths:
+        results[str(docx)] = None
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Invoice building  (DOCX creation only — PDF done in a single batch later)
+# ---------------------------------------------------------------------------
+
+def build_invoice_docx(
+    model: InvoiceModel,
+    template_path: str,
+    out_root: str,
+    policy: str = "overwrite",
+    month_folder: str = None,
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Fill the DOCX template and save to the output folder.
+
+    Returns (docx_path, existing_pdf_path):
+      - existing_pdf_path is set when policy=skip and PDF already exists.
+      - docx_path is None when the file is skipped entirely.
+    """
+    dest_folder = Path(out_root) / (month_folder if month_folder else model.date.strftime("%Y-%m"))
     dest_folder.mkdir(parents=True, exist_ok=True)
 
     clean_client = sanitize_filename(model.buyer_name)
-    target_filename = f"{model.number}_{clean_client}.pdf"
-    target_pdf = dest_folder / target_filename
+    target_pdf = dest_folder / f"{model.number}_{clean_client}.pdf"
 
     if target_pdf.exists():
         if policy == "skip":
-            return f"skipped: {target_pdf}"
+            return None, target_pdf          # nothing to do
         if policy == "version":
             version = 2
             while True:
@@ -83,7 +176,7 @@ def build_invoice(model: InvoiceModel, template_path: str, out_root: str, policy
                     break
                 version += 1
 
-    temp_docx = dest_folder / f"{model.number}_{clean_client}.docx"
+    docx_path = dest_folder / f"{model.number}_{clean_client}.docx"
     replacements = {
         "<number>": model.number,
         "<yyyy-mm-dd>": model.date.isoformat(),
@@ -101,22 +194,13 @@ def build_invoice(model: InvoiceModel, template_path: str, out_root: str, policy
         "<rate>": f"{model.rate:.2f}",
         "<total>": f"{model.total:.2f}",
     }
-    fill_template(template_path, str(temp_docx), replacements)
+    fill_template(template_path, str(docx_path), replacements)
+    return docx_path, None
 
-    if docx_to_pdf is not None:
-        try:
-            docx_to_pdf(str(temp_docx), str(target_pdf))
-            if target_pdf.exists():
-                if temp_docx.exists():
-                    temp_docx.unlink()
-                return str(target_pdf)
-            # fallback to docx when PDF was not created
-        except Exception:
-            pass
 
-    # Fallback: keep DOCX path if PDF conversion unavailable or failed
-    return f"not_converted_saved_docx:{temp_docx}"
-
+# ---------------------------------------------------------------------------
+# Key lookup helpers
+# ---------------------------------------------------------------------------
 
 def normalize_key(value: str) -> str:
     if value is None:
@@ -133,6 +217,10 @@ def find_field(row: Dict[str, str], field_name: str) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Invoice model preparation
+# ---------------------------------------------------------------------------
+
 def prepare_invoice(
     row: Dict[str, str],
     month_column: str,
@@ -147,7 +235,6 @@ def prepare_invoice(
         or ""
     ).strip()
 
-    # If name is still missing, try second column positional fallback (column B style)
     if not name and len(row) > 1:
         keys = list(row.keys())
         name = str(row.get(keys[1], "")).strip()
@@ -156,11 +243,9 @@ def prepare_invoice(
     rate_val = find_field(row, "Rate") or find_field(row, "Kaina") or ""
     sessions_val = find_field(row, month_column) or ""
 
-    # ignore header/summary rows that accidentally may be present
     if not name or name.strip().lower() in {"sesijų skaičius per mėnesį", "viso", "total", "sum"}:
         return None
 
-    # Use default address if not provided
     if not address:
         address = "N/A"
 
@@ -172,7 +257,6 @@ def prepare_invoice(
     if sessions < 0:
         raise ValueError("sessions must be >=0")
 
-    # Do NOT generate invoice if no sessions for the month
     if sessions == 0:
         return None
 
@@ -206,6 +290,10 @@ def prepare_invoice(
     )
 
 
+# ---------------------------------------------------------------------------
+# Batch processing
+# ---------------------------------------------------------------------------
+
 def process_batch(
     rows: List[Dict[str, str]],
     month_column: str,
@@ -216,14 +304,15 @@ def process_batch(
     policy: str,
     selected_clients: Optional[List[str]] = None,
     month_folder: str = None,
-) -> Dict[str, int]:
+) -> Dict:
     counter_data = load_counter(counter_file)
     year = date.today().year
 
-    if month_folder:
-        output_folder_path = (Path(output_root) / month_folder).resolve()
-    else:
-        output_folder_path = Path(output_root).resolve()
+    output_folder_path = (
+        (Path(output_root) / month_folder).resolve()
+        if month_folder
+        else Path(output_root).resolve()
+    )
 
     stats = {
         "processed": 0,
@@ -231,38 +320,62 @@ def process_batch(
         "skipped": 0,
         "errors": 0,
         "output_folder": str(output_folder_path),
+        "error_details": [],
     }
 
+    # Pass 1 — create all DOCX files, collect paths for batch PDF conversion
+    pending_docx: List[Path] = []
+
     for row in rows:
-        # Find client name using normalized key matching
         name = find_field(row, "Client") or find_field(row, "Client Name") or find_field(row, "Name Surname") or ""
         name = name.strip()
-        
-        # Skip empty rows
+
         if not name:
             continue
-            
         if selected_clients and name not in selected_clients:
             continue
 
         try:
-            next_num = next_invoice_number(config.invoice_series, counter_data, year)
-            model = prepare_invoice(row, month_column, config, next_num, date.today())
-
+            model = prepare_invoice(row, month_column, config, "__DRAFT__", date.today())
             if model is None:
                 stats["skipped"] += 1
                 continue
 
-            result = build_invoice(model, template_path, output_root, policy=policy, month_folder=month_folder)
-            stats["generated"] += 1
-            stats["processed"] += 1
-        except Exception as e:
-            # record and continue. Use print/log for debugging.
-            print(f"Row error (row maybe has header/sum): {e}")
-            stats["errors"] += 1
-            if policy == "skip":
+            # Assign invoice number only when model is confirmed valid
+            model.number = next_invoice_number(config.invoice_series, counter_data, year)
+
+            docx_path, existing_pdf = build_invoice_docx(
+                model, template_path, output_root, policy=policy, month_folder=month_folder
+            )
+
+            if existing_pdf is not None:
+                # policy=skip and PDF already exists
                 stats["skipped"] += 1
-            continue
+                continue
+
+            if docx_path is not None:
+                pending_docx.append(docx_path)
+                stats["processed"] += 1
+
+        except Exception as e:
+            msg = str(e)
+            print(f"Row error for '{name}': {msg}")
+            stats["errors"] += 1
+            stats["error_details"].append({"client": name, "reason": msg})
 
     save_counter(counter_data, counter_file)
+
+    # Pass 2 — convert all DOCX → PDF in a single batch (one tool invocation)
+    if pending_docx:
+        pdf_results = batch_convert_to_pdf(pending_docx, output_folder_path)
+        for docx_path in pending_docx:
+            pdf = pdf_results.get(str(docx_path))
+            if pdf and pdf.exists():
+                # Clean up the temp DOCX now that we have a PDF
+                docx_path.unlink(missing_ok=True)
+                stats["generated"] += 1
+            else:
+                # No PDF — keep the DOCX so the user still has something
+                stats["generated"] += 1   # still counts as generated (as DOCX)
+
     return stats

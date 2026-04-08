@@ -1,21 +1,28 @@
+import io
 import os
 import platform
 import subprocess
 from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
 
-from fastapi import FastAPI, Form, Request
+from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from invoice_app.config import load_config, save_default_config
 from invoice_app.data_source import load_clients_from_csv, load_clients_from_xlsx
-from invoice_app.invoice_service import process_batch
+from invoice_app.invoice_service import find_field, prepare_invoice, process_batch
 from invoice_app.models import MONTHS_LT, normalize_month
 
 app = FastAPI(title="Invoices Press Print UI")
+
+MONTH_NAMES = [
+    "sausis", "vasaris", "kovas", "balandis", "geguze", "birzelis",
+    "liepa", "rugpjutis", "rugsejis", "spalis", "lapkritis", "gruodis",
+]
 
 project_root = Path(__file__).resolve().parents[2]
 templates_dir = project_root / "templates"
@@ -28,12 +35,47 @@ if static_dir.exists():
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
+def resolve_path(p: str) -> str:
+    """Resolve a path relative to the project root if it is not absolute."""
+    path = Path(p)
+    if path.is_absolute():
+        return str(path)
+    return str(project_root / path)
+
+
 @app.on_event("startup")
 def startup():
-    if not Path("config.json").exists():
-        save_default_config("config.json")
-    if not Path("invoice_counter.json").exists():
-        Path("invoice_counter.json").write_text('{"year": 0, "counter": 0}', encoding="utf-8")
+    config_path = resolve_path("config.json")
+    counter_path = resolve_path("invoice_counter.json")
+    if not Path(config_path).exists():
+        save_default_config(config_path)
+    if not Path(counter_path).exists():
+        Path(counter_path).write_text('{"year": 0, "counter": 0}', encoding="utf-8")
+
+
+def _load_rows(csv_path: str, uploaded_file: Optional[UploadFile] = None):
+    """Load client rows from an uploaded file or a path on disk."""
+    if uploaded_file and uploaded_file.filename:
+        contents = uploaded_file.file.read()
+        fname = uploaded_file.filename.lower()
+        if fname.endswith(".xlsx") or fname.endswith(".xls"):
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+                tmp.write(contents)
+                tmp_path = tmp.name
+            rows = load_clients_from_xlsx(tmp_path)
+            Path(tmp_path).unlink(missing_ok=True)
+        else:
+            text = contents.decode("utf-8-sig")
+            import csv as csv_mod
+            reader = csv_mod.DictReader(io.StringIO(text))
+            rows = [dict(r) for r in reader]
+        return rows
+
+    csv_path = csv_path.strip()
+    if csv_path.lower().endswith(".xlsx") or csv_path.lower().endswith(".xls"):
+        return load_clients_from_xlsx(csv_path)
+    return load_clients_from_csv(csv_path)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -43,7 +85,7 @@ def index(request: Request):
         "index.html",
         {
             "request": request,
-            "months": ["sausis", "vasaris", "kovas", "balandis", "geguze", "birzelis", "liepa", "rugpjutis", "rugsejis", "spalis", "lapkritis", "gruodis"],
+            "months": MONTH_NAMES,
             "policies": ["overwrite", "skip", "version"],
             "selected_month": "kovas",
             "data_source": default_source,
@@ -91,29 +133,104 @@ def month_number_to_column(month_name: str) -> str:
         return month_name
 
 
-@app.post("/generate", response_class=HTMLResponse)
-def generate(
+@app.post("/preview", response_class=HTMLResponse)
+def preview(
     request: Request,
     month: str = Form("kovas"),
     csv_path: str = Form("data/clients.csv"),
-    template_path: str = Form("Context/template saskaita-faktura .docx"),
+    uploaded_file: Optional[UploadFile] = File(None),
+):
+    config = load_config(resolve_path("config.json"))
+    month_column = month_number_to_column(month)
+
+    try:
+        rows = _load_rows(resolve_path(csv_path), uploaded_file)
+    except Exception as e:
+        return templates.TemplateResponse(
+            "index.html",
+            {
+                "request": request,
+                "months": MONTH_NAMES,
+                "policies": ["overwrite", "skip", "version"],
+                "selected_month": month,
+                "data_source": csv_path,
+                "error": str(e),
+            },
+        )
+
+    preview_rows = []
+    for row in rows:
+        name = (
+            find_field(row, "Client")
+            or find_field(row, "Client Name")
+            or find_field(row, "Name Surname")
+            or ""
+        ).strip()
+        if not name:
+            continue
+        sessions_val = find_field(row, month_column) or ""
+        rate_val = find_field(row, "Rate") or find_field(row, "Kaina") or ""
+        try:
+            sessions = int(float(sessions_val)) if sessions_val else 0
+            rate = Decimal(str(rate_val)) if rate_val else Decimal("0")
+            total = Decimal(sessions) * rate
+        except Exception:
+            sessions, rate, total = 0, Decimal("0"), Decimal("0")
+        preview_rows.append({
+            "name": name,
+            "sessions": sessions,
+            "rate": f"{rate:.2f}",
+            "total": f"{total:.2f}",
+            "will_invoice": sessions > 0 and rate > 0,
+        })
+
+    return templates.TemplateResponse(
+        "index.html",
+        {
+            "request": request,
+            "months": MONTH_NAMES,
+            "policies": ["overwrite", "skip", "version"],
+            "selected_month": month,
+            "data_source": csv_path,
+            "preview_rows": preview_rows,
+            "preview_month": month_column,
+        },
+    )
+
+
+@app.post("/generate", response_class=HTMLResponse)
+async def generate(
+    request: Request,
+    month: str = Form("kovas"),
+    csv_path: str = Form("data/clients.csv"),
+    template_path: str = Form("Context/template saskaita-faktura.docx"),
     policy: str = Form("overwrite"),
     selected: Optional[str] = Form(None),
+    uploaded_file: Optional[UploadFile] = File(None),
 ):
     selected_clients: Optional[List[str]] = None
     if selected:
         selected_clients = [name.strip() for name in selected.split(",") if name.strip()]
 
-    config = load_config("config.json")
-    template_path = template_path.strip()
-    if csv_path.lower().endswith(".xlsx") or csv_path.lower().endswith(".xls"):
-        rows = load_clients_from_xlsx(csv_path)
-    else:
-        rows = load_clients_from_csv(csv_path)
+    config = load_config(resolve_path("config.json"))
+    template_path = resolve_path(template_path.strip())
 
-    # Convert month name to column header (e.g. 'kovas' -> 'Kovas')
+    try:
+        rows = _load_rows(resolve_path(csv_path), uploaded_file)
+    except Exception as e:
+        return templates.TemplateResponse(
+            "index.html",
+            {
+                "request": request,
+                "months": MONTH_NAMES,
+                "policies": ["overwrite", "skip", "version"],
+                "selected_month": month,
+                "data_source": csv_path,
+                "error": f"Could not load data source: {e}",
+            },
+        )
+
     month_column = month_number_to_column(month)
-
     month_folder = month_to_folder(month)
 
     stats = process_batch(
@@ -121,8 +238,8 @@ def generate(
         month_column=month_column,
         config=config,
         template_path=template_path,
-        output_root=config.output_root,
-        counter_file="invoice_counter.json",
+        output_root=resolve_path(config.output_root),
+        counter_file=resolve_path("invoice_counter.json"),
         policy=policy,
         selected_clients=selected_clients,
         month_folder=month_folder,
@@ -134,7 +251,7 @@ def generate(
         "index.html",
         {
             "request": request,
-            "months": ["sausis", "vasaris", "kovas", "balandis", "geguze", "birzelis", "liepa", "rugpjutis", "rugsejis", "spalis", "lapkritis", "gruodis"],
+            "months": MONTH_NAMES,
             "policies": ["overwrite", "skip", "version"],
             "stats": stats,
             "message": "Invoice generation completed",
@@ -148,10 +265,10 @@ def generate(
 
 @app.get("/open-folder")
 def open_folder(month: str = "kovas"):
-    config = load_config("config.json")
+    config = load_config(resolve_path("config.json"))
     month_folder = month_to_folder(month)
 
-    folder_path = Path(config.output_root) / month_folder
+    folder_path = Path(resolve_path(config.output_root)) / month_folder
     folder_path.mkdir(parents=True, exist_ok=True)
 
     if platform.system() == "Darwin":

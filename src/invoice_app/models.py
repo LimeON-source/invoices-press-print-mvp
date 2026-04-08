@@ -34,6 +34,8 @@ class AppConfig(BaseModel):
 
 
 class InvoiceModel(BaseModel):
+    model_config = {"frozen": False}
+
     number: str
     date: date
     seller: SellerConfig
