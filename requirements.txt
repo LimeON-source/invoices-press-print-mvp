@@ -1,5 +1,6 @@
 pydantic>=2.0
 pytest
+httpx
 python-docx
 docx2pdf
 num2words

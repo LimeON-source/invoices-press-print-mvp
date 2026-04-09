@@ -2,13 +2,14 @@ import io
 import os
 import platform
 import subprocess
+import uuid
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import List, Optional
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -27,7 +28,10 @@ MONTH_NAMES = [
 project_root = Path(__file__).resolve().parents[2]
 templates_dir = project_root / "templates"
 static_dir = project_root / "static"
+tmp_dir = project_root / "tmp"
+
 static_dir.mkdir(parents=True, exist_ok=True)
+tmp_dir.mkdir(parents=True, exist_ok=True)
 
 templates = Jinja2Templates(directory=str(templates_dir))
 
@@ -43,6 +47,11 @@ def resolve_path(p: str) -> str:
     return str(project_root / path)
 
 
+def current_month_name() -> str:
+    """Return the Lithuanian month name for today's month."""
+    return MONTH_NAMES[date.today().month - 1]
+
+
 @app.on_event("startup")
 def startup():
     config_path = resolve_path("config.json")
@@ -51,6 +60,15 @@ def startup():
         save_default_config(config_path)
     if not Path(counter_path).exists():
         Path(counter_path).write_text('{"year": 0, "counter": 0}', encoding="utf-8")
+
+
+def _save_upload_to_tmp(uploaded_file: UploadFile) -> str:
+    """Save an uploaded file to the tmp directory and return its path."""
+    suffix = Path(uploaded_file.filename).suffix
+    tmp_path = tmp_dir / f"{uuid.uuid4().hex}{suffix}"
+    contents = uploaded_file.file.read()
+    tmp_path.write_bytes(contents)
+    return str(tmp_path)
 
 
 def _load_rows(csv_path: str, uploaded_file: Optional[UploadFile] = None):
@@ -87,7 +105,8 @@ def index(request: Request):
             "request": request,
             "months": MONTH_NAMES,
             "policies": ["overwrite", "skip", "version"],
-            "selected_month": "kovas",
+            # Improvement 1: auto-select today's month
+            "selected_month": current_month_name(),
             "data_source": default_source,
         },
     )
@@ -95,10 +114,8 @@ def index(request: Request):
 
 def month_name_to_number(month_name: str) -> int:
     try:
-        # support numeric months too
         return normalize_month(month_name)
     except ValueError:
-        # 2026-03 style input supports this also
         if "-" in month_name:
             parts = month_name.split("-")
             if parts[-1].isdigit():
@@ -113,13 +130,10 @@ def month_to_folder(month_name: str) -> str:
     try:
         month_number = month_name_to_number(month_name)
         if 1 <= month_number <= 12:
-            months = ["sausis", "vasaris", "kovas", "balandis", "geguze", "birzelis", "liepa", "rugpjutis", "rugsejis", "spalis", "lapkritis", "gruodis"]
-            return months[month_number - 1]
+            return MONTH_NAMES[month_number - 1]
     except ValueError:
         pass
     normalized = month_name.strip().lower()
-    if normalized in MONTHS_LT:
-        return normalized
     return normalized
 
 
@@ -127,10 +141,21 @@ def month_number_to_column(month_name: str) -> str:
     """Convert month name/number to column header name (e.g. 'kovas' -> 'Kovas')"""
     try:
         month_number = normalize_month(month_name)
-        months = ["sausis", "vasaris", "kovas", "balandis", "geguze", "birzelis", "liepa", "rugpjutis", "rugsejis", "spalis", "lapkritis", "gruodis"]
-        return months[month_number - 1].capitalize()
+        return MONTH_NAMES[month_number - 1].capitalize()
     except ValueError:
         return month_name
+
+
+# Improvement 3: check how many invoices already exist for a month
+@app.get("/check-existing")
+def check_existing(month: str = "kovas") -> JSONResponse:
+    config = load_config(resolve_path("config.json"))
+    month_folder = month_to_folder(month)
+    folder = Path(resolve_path(config.output_root)) / month_folder
+    if not folder.exists():
+        return JSONResponse({"count": 0, "month": month_folder})
+    count = len(list(folder.glob("*.pdf"))) + len(list(folder.glob("*.docx")))
+    return JSONResponse({"count": count, "month": month_folder})
 
 
 @app.post("/preview", response_class=HTMLResponse)
@@ -143,8 +168,17 @@ def preview(
     config = load_config(resolve_path("config.json"))
     month_column = month_number_to_column(month)
 
+    # Improvement 5: save uploaded file to tmp so Generate can reuse it
+    effective_csv_path = csv_path
+    tmp_csv_path = None
+    if uploaded_file and uploaded_file.filename:
+        tmp_csv_path = _save_upload_to_tmp(uploaded_file)
+        effective_csv_path = tmp_csv_path
+        # Reset file pointer for _load_rows (already consumed above, use path)
+        uploaded_file = None
+
     try:
-        rows = _load_rows(resolve_path(csv_path), uploaded_file)
+        rows = _load_rows(resolve_path(effective_csv_path) if not tmp_csv_path else effective_csv_path)
     except Exception as e:
         return templates.TemplateResponse(
             "index.html",
@@ -184,6 +218,10 @@ def preview(
             "will_invoice": sessions > 0 and rate > 0,
         })
 
+    preview_total = sum(
+        Decimal(r["total"]) for r in preview_rows if r["will_invoice"]
+    )
+
     return templates.TemplateResponse(
         "index.html",
         {
@@ -194,6 +232,9 @@ def preview(
             "data_source": csv_path,
             "preview_rows": preview_rows,
             "preview_month": month_column,
+            "preview_total": f"{preview_total:.2f}",
+            # Improvement 5: pass tmp path so Generate button can reuse it
+            "tmp_csv_path": tmp_csv_path or resolve_path(csv_path),
         },
     )
 
@@ -215,8 +256,11 @@ async def generate(
     config = load_config(resolve_path("config.json"))
     template_path = resolve_path(template_path.strip())
 
+    # If csv_path is already absolute (came from tmp), use as-is
+    effective_csv = csv_path if Path(csv_path).is_absolute() else resolve_path(csv_path)
+
     try:
-        rows = _load_rows(resolve_path(csv_path), uploaded_file)
+        rows = _load_rows(effective_csv, uploaded_file)
     except Exception as e:
         return templates.TemplateResponse(
             "index.html",
@@ -245,6 +289,10 @@ async def generate(
         month_folder=month_folder,
     )
 
+    # Clean up tmp file if it was a temp upload path
+    if Path(csv_path).is_absolute() and str(tmp_dir) in csv_path:
+        Path(csv_path).unlink(missing_ok=True)
+
     invoice_folder = str(Path(config.output_root) / month_folder)
 
     return templates.TemplateResponse(
@@ -254,11 +302,13 @@ async def generate(
             "months": MONTH_NAMES,
             "policies": ["overwrite", "skip", "version"],
             "stats": stats,
+            # Improvement 4: total_amount from stats
+            "total_amount": f"{stats.get('total_amount', Decimal('0')):.2f}",
             "message": "Invoice generation completed",
             "invoice_folder": invoice_folder,
             "invoice_month_folder": month_folder,
             "selected_month": month,
-            "data_source": csv_path,
+            "data_source": csv_path if not (Path(csv_path).is_absolute() and str(tmp_dir) in csv_path) else "Context/Psichoterapijos apskaita.xlsx",
         },
     )
 

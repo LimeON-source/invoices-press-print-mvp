@@ -319,6 +319,7 @@ def process_batch(
         "generated": 0,
         "skipped": 0,
         "errors": 0,
+        "total_amount": Decimal("0"),
         "output_folder": str(output_folder_path),
         "error_details": [],
     }
@@ -343,6 +344,7 @@ def process_batch(
 
             # Assign invoice number only when model is confirmed valid
             model.number = next_invoice_number(config.invoice_series, counter_data, year)
+            stats["total_amount"] += model.total
 
             docx_path, existing_pdf = build_invoice_docx(
                 model, template_path, output_root, policy=policy, month_folder=month_folder
