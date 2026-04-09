@@ -214,12 +214,15 @@ def test_generate_button_has_onclick_handler():
     assert response.status_code == 200
     assert "handleGenerate" in response.text
 
-def test_generate_button_confirmed_flag_pattern():
-    """Generate must use data-confirmed pattern (not form.submit) to preserve file inputs."""
+def test_generate_button_uses_native_submit():
+    """Generate button must submit natively (no async intercept) to preserve file inputs."""
     response = client.get("/")
     assert response.status_code == 200
-    assert "btn.dataset.confirmed" in response.text
-    assert "btn.click()" in response.text
+    assert "handleGenerate" in response.text
+    assert "requestAnimationFrame" in response.text
+    # No async intercept that broke file uploads
+    assert "btn.click()" not in response.text
+    assert "requestSubmit" not in response.text
 
 
 def test_preview_button_uses_formaction():
@@ -304,6 +307,112 @@ def test_preview_uploaded_file_takes_priority_over_path():
 
     assert response.status_code == 200
     assert "PREVIEW_UPLOAD_CLIENT" in response.text
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: preview and generate with real xlsx data
+# ---------------------------------------------------------------------------
+
+REAL_XLSX = "Context/Psichoterapijos apskaita.xlsx"
+REAL_TEMPLATE = "Context/template saskaita-faktura.docx"
+
+
+def test_preview_with_real_data_returns_client_rows():
+    """Preview with the real xlsx must return a table of client rows."""
+    response = client.post("/preview", data={
+        "month": "vasaris",
+        "csv_path": REAL_XLSX,
+    })
+    assert response.status_code == 200
+    assert "will-invoice" in response.text or "no-invoice" in response.text
+    assert "badge-yes" in response.text
+
+
+def test_preview_with_real_data_excludes_summary_rows():
+    """Rows like 'Uždarbis' must not appear in the preview table."""
+    response = client.post("/preview", data={
+        "month": "vasaris",
+        "csv_path": REAL_XLSX,
+    })
+    assert response.status_code == 200
+    assert "Uždarbis" not in response.text
+    assert "Udarbis" not in response.text
+
+
+def test_preview_with_real_data_shows_correct_total():
+    """Preview total must not include summary rows — must be a sane value."""
+    import re
+    response = client.post("/preview", data={
+        "month": "vasaris",
+        "csv_path": REAL_XLSX,
+    })
+    assert response.status_code == 200
+    totals = re.findall(r"€([\d,]+\.?\d*)", response.text)
+    for t in totals:
+        numeric = float(t.replace(",", ""))
+        assert numeric < 1_000_000, f"Total {numeric} is unrealistically large — summary row not filtered"
+
+
+def test_preview_empty_month_shows_warning():
+    """Preview for a month with no session data must show a warning."""
+    response = client.post("/preview", data={
+        "month": "kovas",
+        "csv_path": REAL_XLSX,
+    })
+    assert response.status_code == 200
+    assert "No clients have sessions" in response.text or "⚠️" in response.text
+
+
+def test_generate_with_real_data_produces_invoices(tmp_path):
+    """Generate with real data must create at least one invoice."""
+    with patch("invoice_app.web.resolve_path") as mock_resolve:
+        def smart_resolve(p):
+            if "invoice_numbers" in str(p):
+                return str(tmp_path / "invoice_numbers.json")
+            if "config" in str(p) and str(p).endswith("config.json"):
+                return "config.json"
+            if "Invoices" in str(p) or str(p) == "Invoices":
+                return str(tmp_path / "Invoices")
+            from invoice_app.web import project_root
+            from pathlib import Path as P
+            path = P(p)
+            if path.is_absolute():
+                return str(path)
+            return str(project_root / path)
+        mock_resolve.side_effect = smart_resolve
+
+        response = client.post("/generate", data={
+            "month": "vasaris",
+            "csv_path": REAL_XLSX,
+            "template_path": REAL_TEMPLATE,
+            "policy": "overwrite",
+        })
+
+    assert response.status_code == 200
+    import re
+    stats = re.findall(r"<strong>(\d+)</strong>", response.text)
+    generated = int(stats[0]) if stats else 0
+    errors = int(stats[2]) if len(stats) > 2 else 0
+    assert generated > 0, f"Expected invoices to be generated but got 0 (errors={errors})"
+    assert errors == 0
+
+
+def test_generate_empty_month_shows_warning():
+    """Generate for a month with no data must show a warning, not a silent 0."""
+    with patch("invoice_app.web.process_batch", return_value={
+        "generated": 0, "skipped": 36, "errors": 0,
+        "total_amount": Decimal("0"), "output_folder": "/tmp", "error_details": [],
+    }), patch("invoice_app.web._load_rows", return_value=[]), \
+       patch("invoice_app.web.load_config") as mock_cfg:
+        mock_cfg.return_value = MagicMock(output_root="Invoices", seller=MagicMock())
+        response = client.post("/generate", data={
+            "month": "kovas",
+            "csv_path": REAL_XLSX,
+            "template_path": REAL_TEMPLATE,
+            "policy": "overwrite",
+        })
+    assert response.status_code == 200
+    assert "No invoices were generated" in response.text or "⚠️" in response.text
 
 
 def test_generate_bad_data_source_shows_error():

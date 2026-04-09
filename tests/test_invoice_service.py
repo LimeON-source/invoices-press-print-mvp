@@ -1,4 +1,4 @@
-"""Tests for invoice_service.py — counter, batch processing, PDF conversion."""
+"""Tests for invoice_service.py — registry, batch processing, PDF conversion."""
 import json
 from datetime import date
 from decimal import Decimal
@@ -9,16 +9,20 @@ import pytest
 
 from invoice_app.config import load_config
 from invoice_app.invoice_service import (
+    assign_invoice_numbers,
     batch_convert_to_pdf,
     build_invoice_docx,
     convert_amount_to_words,
     find_field,
     load_counter,
+    load_registry,
     next_invoice_number,
     normalize_key,
     prepare_invoice,
+    preview_invoice_numbers,
     process_batch,
     save_counter,
+    save_registry,
     sanitize_filename,
     _libreoffice_path,
 )
@@ -103,6 +107,57 @@ def test_next_invoice_number_resets_on_new_year():
 
 
 # ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+def test_assign_invoice_numbers_sequential(tmp_path):
+    reg = str(tmp_path / "reg.json")
+    result = assign_invoice_numbers("vasaris", ["Agnė", "Akvilė"], 2026, "SS", reg)
+    assert result["Agnė"] == "SS-2026-001"
+    assert result["Akvilė"] == "SS-2026-002"
+
+
+def test_assign_invoice_numbers_idempotent(tmp_path):
+    reg = str(tmp_path / "reg.json")
+    first = assign_invoice_numbers("vasaris", ["Agnė"], 2026, "SS", reg)
+    second = assign_invoice_numbers("vasaris", ["Agnė"], 2026, "SS", reg)
+    assert first["Agnė"] == second["Agnė"]
+    registry = load_registry(reg)
+    assert registry["2026"]["counter"] == 1  # not incremented on second call
+
+
+def test_assign_invoice_numbers_new_client_gets_next(tmp_path):
+    reg = str(tmp_path / "reg.json")
+    assign_invoice_numbers("vasaris", ["Agnė", "Akvilė"], 2026, "SS", reg)
+    result = assign_invoice_numbers("vasaris", ["Agnė", "Jonas"], 2026, "SS", reg)
+    assert result["Agnė"] == "SS-2026-001"   # locked — unchanged
+    assert result["Jonas"] == "SS-2026-003"  # next after existing 2
+
+
+def test_assign_invoice_numbers_resets_each_year(tmp_path):
+    reg = str(tmp_path / "reg.json")
+    assign_invoice_numbers("vasaris", ["Agnė"], 2026, "SS", reg)
+    result = assign_invoice_numbers("vasaris", ["Agnė"], 2027, "SS", reg)
+    assert result["Agnė"] == "SS-2027-001"
+
+
+def test_preview_invoice_numbers_does_not_write(tmp_path):
+    reg = str(tmp_path / "reg.json")
+    preview_invoice_numbers("vasaris", ["Agnė"], 2026, "SS", reg)
+    assert not (tmp_path / "reg.json").exists()  # file not created
+
+
+def test_preview_invoice_numbers_shows_locked(tmp_path):
+    reg = str(tmp_path / "reg.json")
+    assign_invoice_numbers("vasaris", ["Agnė"], 2026, "SS", reg)
+    result = preview_invoice_numbers("vasaris", ["Agnė", "Jonas"], 2026, "SS", reg)
+    assert result["Agnė"]["locked"] is True
+    assert result["Agnė"]["number"] == "SS-2026-001"
+    assert result["Jonas"]["locked"] is False
+    assert result["Jonas"]["number"] == "SS-2026-002"
+
+
+# ---------------------------------------------------------------------------
 # Amount to words
 # ---------------------------------------------------------------------------
 
@@ -168,6 +223,17 @@ def test_prepare_invoice_valid_row_returns_model(config):
 def test_prepare_invoice_skips_summary_row(config):
     row = {"Client": "Viso", "Kovas": "10", "Rate": "50"}
     assert prepare_invoice(row, "Kovas", config, "SS-001", date.today()) is None
+
+
+def test_prepare_invoice_skips_uzdarbis_row(config):
+    """Financial summary rows like 'Uždarbis' must never become invoices."""
+    row = {"Name Surname": "Uždarbis", "Vasaris": "4860", "Kaina": "4800"}
+    assert prepare_invoice(row, "Vasaris", config, "SS-001", date.today()) is None
+
+
+def test_prepare_invoice_skips_udarbis_variant(config):
+    row = {"Name Surname": "Udarbis", "Vasaris": "100", "Kaina": "100"}
+    assert prepare_invoice(row, "Vasaris", config, "SS-001", date.today()) is None
 
 
 def test_prepare_invoice_default_address(config):
@@ -290,14 +356,12 @@ def test_batch_convert_empty_list(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# process_batch — counter fix, total_amount, error tracking
+# process_batch — registry-based numbering, total_amount, error tracking
 # ---------------------------------------------------------------------------
 
-def test_process_batch_counter_not_incremented_on_skip(config, tmp_path):
-    """Invoice numbers must NOT be consumed for rows with 0 sessions."""
-    counter_file = str(tmp_path / "counter.json")
-    save_counter({"year": 2026, "counter": 0}, counter_file)
-
+def test_process_batch_number_not_assigned_on_skip(config, tmp_path):
+    """Invoice numbers must NOT be assigned for rows with 0 sessions."""
+    reg = str(tmp_path / "reg.json")
     rows = [
         {"Client": "Jonas", "Kovas": "0", "Rate": "50"},   # 0 sessions → skip
         {"Client": "Petras", "Kovas": "3", "Rate": "50"},  # valid
@@ -311,23 +375,23 @@ def test_process_batch_counter_not_incremented_on_skip(config, tmp_path):
         stats = process_batch(
             rows=rows, month_column="Kovas", config=config,
             template_path="t.docx", output_root=config.output_root,
-            counter_file=counter_file, policy="overwrite", month_folder="kovas",
+            registry_file=reg, policy="overwrite", month_folder="kovas",
         )
 
-    counter = load_counter(counter_file)
-    # Only 1 valid invoice → counter should be 1, not 2
-    assert counter["counter"] == 1
+    registry = load_registry(reg)
+    year_data = registry.get(str(date.today().year), {})
+    assert year_data["counter"] == 1          # only Petras got a number
+    assert "Petras" in year_data["months"]["kovas"]
+    assert "Jonas" not in year_data["months"]["kovas"]
     assert stats["skipped"] == 1
     assert stats["processed"] == 1
 
 
-def test_process_batch_counter_not_incremented_on_error(config, tmp_path):
-    """Invoice numbers must NOT be consumed when prepare_invoice raises."""
-    counter_file = str(tmp_path / "counter.json")
-    save_counter({"year": 2026, "counter": 0}, counter_file)
-
+def test_process_batch_number_not_assigned_on_error(config, tmp_path):
+    """Invoice numbers must NOT be assigned when prepare_invoice raises."""
+    reg = str(tmp_path / "reg.json")
     rows = [
-        {"Client": "Bad", "Kovas": "3", "Rate": "not-a-number"},  # will error
+        {"Client": "Bad", "Kovas": "3", "Rate": "not-a-number"},
         {"Client": "Good", "Kovas": "2", "Rate": "40"},
     ]
 
@@ -339,20 +403,44 @@ def test_process_batch_counter_not_incremented_on_error(config, tmp_path):
         stats = process_batch(
             rows=rows, month_column="Kovas", config=config,
             template_path="t.docx", output_root=config.output_root,
-            counter_file=counter_file, policy="overwrite", month_folder="kovas",
+            registry_file=reg, policy="overwrite", month_folder="kovas",
         )
 
-    counter = load_counter(counter_file)
-    assert counter["counter"] == 1  # only Good consumed a number
+    registry = load_registry(reg)
+    assert registry[str(date.today().year)]["counter"] == 1  # only Good
     assert stats["errors"] == 1
     assert stats["error_details"][0]["client"] == "Bad"
 
 
-def test_process_batch_total_amount(config, tmp_path):
-    """stats['total_amount'] must sum all generated invoice totals."""
-    counter_file = str(tmp_path / "counter.json")
-    save_counter({"year": 2026, "counter": 0}, counter_file)
+def test_process_batch_idempotent_numbers(config, tmp_path):
+    """Regenerating same month must reuse existing invoice numbers."""
+    reg = str(tmp_path / "reg.json")
+    rows = [{"Client": "Petras", "Kovas": "3", "Rate": "50"}]
 
+    with patch("invoice_app.invoice_service.build_invoice_docx") as mock_build, \
+         patch("invoice_app.invoice_service.batch_convert_to_pdf") as mock_pdf:
+        mock_build.return_value = (tmp_path / "x.docx", None)
+        mock_pdf.return_value = {str(tmp_path / "x.docx"): tmp_path / "x.pdf"}
+
+        process_batch(
+            rows=rows, month_column="Kovas", config=config,
+            template_path="t.docx", output_root=config.output_root,
+            registry_file=reg, policy="overwrite", month_folder="kovas",
+        )
+        mock_build.reset_mock()
+        process_batch(
+            rows=rows, month_column="Kovas", config=config,
+            template_path="t.docx", output_root=config.output_root,
+            registry_file=reg, policy="overwrite", month_folder="kovas",
+        )
+
+    registry = load_registry(reg)
+    assert registry[str(date.today().year)]["counter"] == 1  # not incremented twice
+
+
+def test_process_batch_total_amount(config, tmp_path):
+    """stats['total_amount'] must sum all valid invoice totals."""
+    reg = str(tmp_path / "reg.json")
     rows = [
         {"Client": "A", "Kovas": "4", "Rate": "50"},   # 200
         {"Client": "B", "Kovas": "2", "Rate": "100"},  # 200
@@ -366,20 +454,20 @@ def test_process_batch_total_amount(config, tmp_path):
         stats = process_batch(
             rows=rows, month_column="Kovas", config=config,
             template_path="t.docx", output_root=config.output_root,
-            counter_file=counter_file, policy="overwrite", month_folder="kovas",
+            registry_file=reg, policy="overwrite", month_folder="kovas",
         )
 
     assert stats["total_amount"] == Decimal("400")
 
 
 def test_process_batch_error_details_recorded(config, tmp_path):
-    counter_file = str(tmp_path / "counter.json")
+    reg = str(tmp_path / "reg.json")
     rows = [{"Client": "Broken", "Kovas": "x", "Rate": "50"}]
 
     stats = process_batch(
         rows=rows, month_column="Kovas", config=config,
         template_path="t.docx", output_root=config.output_root,
-        counter_file=counter_file, policy="overwrite", month_folder="kovas",
+        registry_file=reg, policy="overwrite", month_folder="kovas",
     )
 
     assert stats["errors"] == 1
@@ -388,9 +476,7 @@ def test_process_batch_error_details_recorded(config, tmp_path):
 
 
 def test_process_batch_selected_clients_filter(config, tmp_path):
-    counter_file = str(tmp_path / "counter.json")
-    save_counter({"year": 2026, "counter": 0}, counter_file)
-
+    reg = str(tmp_path / "reg.json")
     rows = [
         {"Client": "Jonas", "Kovas": "2", "Rate": "50"},
         {"Client": "Petras", "Kovas": "3", "Rate": "50"},
@@ -404,7 +490,7 @@ def test_process_batch_selected_clients_filter(config, tmp_path):
         stats = process_batch(
             rows=rows, month_column="Kovas", config=config,
             template_path="t.docx", output_root=config.output_root,
-            counter_file=counter_file, policy="overwrite",
+            registry_file=reg, policy="overwrite",
             selected_clients=["Jonas"], month_folder="kovas",
         )
 

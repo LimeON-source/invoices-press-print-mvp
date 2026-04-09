@@ -45,6 +45,86 @@ def next_invoice_number(series: str, counter_data: Dict[str, int], target_year: 
     return f"{series}-{target_year}-{counter_data['counter']:03d}"
 
 
+# ---------------------------------------------------------------------------
+# Invoice number registry — stable, year-scoped, idempotent
+# ---------------------------------------------------------------------------
+
+def load_registry(path: str) -> dict:
+    """Load {year: {counter: N, months: {month: {client: number}}}}."""
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with p.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_registry(registry: dict, path: str) -> None:
+    Path(path).write_text(json.dumps(registry, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def preview_invoice_numbers(
+    month: str,
+    client_names: List[str],
+    year: int,
+    series: str,
+    registry_path: str,
+) -> Dict[str, dict]:
+    """Return proposed numbers WITHOUT writing to registry.
+
+    Returns {client_name: {"number": "SS-2026-001", "locked": bool}}
+    locked=True means the number already exists in the registry for this client/month.
+    """
+    registry = load_registry(registry_path)
+    year_data = registry.get(str(year), {"counter": 0, "months": {}})
+    month_data = year_data.get("months", {}).get(month, {})
+    counter = year_data.get("counter", 0)
+    result: Dict[str, dict] = {}
+    for client in client_names:
+        if client in month_data:
+            result[client] = {
+                "number": f"{series}-{year}-{month_data[client]:03d}",
+                "locked": True,
+            }
+        else:
+            counter += 1
+            result[client] = {
+                "number": f"{series}-{year}-{counter:03d}",
+                "locked": False,
+            }
+    return result
+
+
+def assign_invoice_numbers(
+    month: str,
+    client_names: List[str],
+    year: int,
+    series: str,
+    registry_path: str,
+) -> Dict[str, str]:
+    """Assign numbers, persisting to registry. Idempotent for existing entries.
+
+    Returns {client_name: "SS-2026-001"}.
+    """
+    registry = load_registry(registry_path)
+    year_str = str(year)
+    if year_str not in registry:
+        registry[year_str] = {"counter": 0, "months": {}}
+    year_data = registry[year_str]
+    if month not in year_data["months"]:
+        year_data["months"][month] = {}
+    month_data = year_data["months"][month]
+    result: Dict[str, str] = {}
+    for client in client_names:
+        if client in month_data:
+            result[client] = f"{series}-{year}-{month_data[client]:03d}"
+        else:
+            year_data["counter"] += 1
+            month_data[client] = year_data["counter"]
+            result[client] = f"{series}-{year}-{year_data['counter']:03d}"
+    save_registry(registry, registry_path)
+    return result
+
+
 def convert_amount_to_words(amount) -> str:
     if not num2words:
         return f"{amount:.2f}"
@@ -243,7 +323,11 @@ def prepare_invoice(
     rate_val = find_field(row, "Rate") or find_field(row, "Kaina") or ""
     sessions_val = find_field(row, month_column) or ""
 
-    if not name or name.strip().lower() in {"sesijų skaičius per mėnesį", "viso", "total", "sum"}:
+    _SUMMARY_ROWS = {
+        "sesijų skaičius per mėnesį", "viso", "total", "sum",
+        "uždarbis", "udarbis", "pajamos", "income", "earnings",
+    }
+    if not name or normalize_key(name.rstrip(":;,.")) in {normalize_key(s) for s in _SUMMARY_ROWS}:
         return None
 
     if not address:
@@ -300,14 +384,12 @@ def process_batch(
     config: AppConfig,
     template_path: str,
     output_root: str,
-    counter_file: str,
+    registry_file: str,
     policy: str,
     selected_clients: Optional[List[str]] = None,
     month_folder: str = None,
 ) -> Dict:
-    counter_data = load_counter(counter_file)
     year = date.today().year
-
     output_folder_path = (
         (Path(output_root) / month_folder).resolve()
         if month_folder
@@ -324,60 +406,70 @@ def process_batch(
         "error_details": [],
     }
 
-    # Pass 1 — create all DOCX files, collect paths for batch PDF conversion
-    pending_docx: List[Path] = []
-
+    # Pass 0 — validate all rows, collect valid models
+    valid_models: Dict[str, object] = {}
     for row in rows:
-        name = find_field(row, "Client") or find_field(row, "Client Name") or find_field(row, "Name Surname") or ""
-        name = name.strip()
-
+        name = (
+            find_field(row, "Client")
+            or find_field(row, "Client Name")
+            or find_field(row, "Name Surname")
+            or ""
+        ).strip()
         if not name:
             continue
         if selected_clients and name not in selected_clients:
             continue
-
         try:
             model = prepare_invoice(row, month_column, config, "__DRAFT__", date.today())
             if model is None:
                 stats["skipped"] += 1
                 continue
-
-            # Assign invoice number only when model is confirmed valid
-            model.number = next_invoice_number(config.invoice_series, counter_data, year)
-            stats["total_amount"] += model.total
-
-            docx_path, existing_pdf = build_invoice_docx(
-                model, template_path, output_root, policy=policy, month_folder=month_folder
-            )
-
-            if existing_pdf is not None:
-                # policy=skip and PDF already exists
-                stats["skipped"] += 1
-                continue
-
-            if docx_path is not None:
-                pending_docx.append(docx_path)
-                stats["processed"] += 1
-
+            valid_models[name] = model
         except Exception as e:
             msg = str(e)
             print(f"Row error for '{name}': {msg}")
             stats["errors"] += 1
             stats["error_details"].append({"client": name, "reason": msg})
 
-    save_counter(counter_data, counter_file)
+    # Assign numbers for all valid clients — idempotent via registry
+    if valid_models:
+        registry_month = month_folder or month_column.lower()
+        invoice_numbers = assign_invoice_numbers(
+            registry_month, list(valid_models.keys()), year,
+            config.invoice_series, registry_file,
+        )
+        for name, model in valid_models.items():
+            model.number = invoice_numbers[name]
+            stats["total_amount"] += model.total
 
-    # Pass 2 — convert all DOCX → PDF in a single batch (one tool invocation)
+    # Pass 1 — create all DOCX files
+    pending_docx: List[Path] = []
+    for name, model in valid_models.items():
+        try:
+            docx_path, existing_pdf = build_invoice_docx(
+                model, template_path, output_root, policy=policy, month_folder=month_folder
+            )
+            if existing_pdf is not None:
+                stats["skipped"] += 1
+                continue
+            if docx_path is not None:
+                pending_docx.append(docx_path)
+                stats["processed"] += 1
+        except Exception as e:
+            msg = str(e)
+            print(f"DOCX error for '{name}': {msg}")
+            stats["errors"] += 1
+            stats["error_details"].append({"client": name, "reason": msg})
+
+    # Pass 2 — convert all DOCX → PDF in a single batch
     if pending_docx:
         pdf_results = batch_convert_to_pdf(pending_docx, output_folder_path)
         for docx_path in pending_docx:
             pdf = pdf_results.get(str(docx_path))
             if pdf and pdf.exists():
-                # Clean up the temp DOCX now that we have a PDF
                 docx_path.unlink(missing_ok=True)
                 stats["generated"] += 1
             else:
-                # No PDF — keep the DOCX so the user still has something
-                stats["generated"] += 1   # still counts as generated (as DOCX)
+                stats["generated"] += 1  # keep DOCX fallback
 
     return stats

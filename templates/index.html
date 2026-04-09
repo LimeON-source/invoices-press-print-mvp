@@ -62,6 +62,14 @@
 <div class="alert alert-error">⚠️ {{ error }}</div>
 {% endif %}
 
+{% if no_data_warning %}
+<div class="alert alert-warning">⚠️ {{ no_data_warning }}</div>
+{% endif %}
+
+{% if sequence_warning %}
+<div class="alert alert-warning">⚠️ {{ sequence_warning }}</div>
+{% endif %}
+
 {% if message %}
 <div class="alert alert-success">
   ✅ {{ message }} —
@@ -110,7 +118,7 @@
   </div>
   <table style="margin-top:12px;">
     <thead>
-      <tr><th>Client</th><th>Sessions</th><th>Rate (€)</th><th>Total (€)</th><th>Invoice?</th></tr>
+      <tr><th>Client</th><th>Sessions</th><th>Rate (€)</th><th>Total (€)</th><th>Invoice?</th><th>Invoice #</th></tr>
     </thead>
     <tbody>
       {% for row in preview_rows %}
@@ -123,6 +131,12 @@
           {% if row.will_invoice %}<span class="badge badge-yes">Yes</span>
           {% else %}<span class="badge badge-no">No</span>{% endif %}
         </td>
+        <td style="text-align:center; font-size:13px; color:#57606a;">
+          {% if row.will_invoice and row.invoice_number %}
+            {% if row.invoice_locked %}🔒 {{ row.invoice_number }}
+            {% else %}{{ row.invoice_number }}{% endif %}
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </tbody>
@@ -131,6 +145,7 @@
       <tr>
         <td colspan="3" style="text-align:right;">Grand Total</td>
         <td style="text-align:right;">€{{ preview_total }}</td>
+        <td></td>
         <td></td>
       </tr>
     </tfoot>
@@ -203,10 +218,11 @@
               onclick="return handleGenerate(this)">
         Generate Invoices
       </button>
-      <!-- Preview: formaction overrides the form action natively — file input is included. -->
+      <!-- Preview: formaction overrides the form action natively — file input is included.
+           Spinner fires after a rAF so the browser captures formaction before btn is disabled. -->
       <button type="submit" class="btn-secondary" id="btnPreview"
               formaction="/preview"
-              onclick="showSpinner(this, 'Loading preview…')">
+              onclick="requestAnimationFrame(() => showSpinner(this, 'Loading preview…'))">
         Preview
       </button>
     </div>
@@ -220,40 +236,12 @@
   }
 
   function handleGenerate(btn) {
-    const month = document.getElementById('month').value;
-    const policy = document.getElementById('policy').value;
-
-    // Second pass after async confirmation — submit natively so file input is included.
-    if (btn.dataset.confirmed === '1') {
-      delete btn.dataset.confirmed;
-      showSpinner(btn, 'Generating…');
-      return true;
-    }
-
-    if (policy === 'overwrite') {
-      fetch('/check-existing?month=' + encodeURIComponent(month))
-        .then(r => r.json())
-        .then(data => {
-          if (data.count > 0) {
-            const ok = confirm(
-              data.count + ' invoice(s) already exist for "' + data.month +
-              '".\n\nOverwrite them all?'
-            );
-            if (!ok) return;
-          }
-          // Mark as confirmed and re-click so the form submits natively (file included).
-          btn.dataset.confirmed = '1';
-          btn.click();
-        });
-      return false; // block this first click
-    }
-
-    showSpinner(btn, 'Generating…');
+    requestAnimationFrame(() => showSpinner(btn, 'Generating…'));
     return true;
   }
 
   function handleGenerateFromPreview(btn) {
-    showSpinner(btn, 'Generating…');
+    requestAnimationFrame(() => showSpinner(btn, 'Generating…'));
     return true;
   }
 </script>

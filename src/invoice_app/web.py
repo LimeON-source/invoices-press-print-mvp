@@ -15,7 +15,10 @@ from fastapi.templating import Jinja2Templates
 
 from invoice_app.config import load_config, save_default_config
 from invoice_app.data_source import load_clients_from_csv, load_clients_from_xlsx
-from invoice_app.invoice_service import find_field, prepare_invoice, process_batch
+from invoice_app.invoice_service import (
+    find_field, load_registry, prepare_invoice,
+    preview_invoice_numbers, process_batch,
+)
 from invoice_app.models import MONTHS_LT, normalize_month
 
 app = FastAPI(title="Invoices Press Print UI")
@@ -55,11 +58,11 @@ def current_month_name() -> str:
 @app.on_event("startup")
 def startup():
     config_path = resolve_path("config.json")
-    counter_path = resolve_path("invoice_counter.json")
+    registry_path = resolve_path("invoice_numbers.json")
     if not Path(config_path).exists():
         save_default_config(config_path)
-    if not Path(counter_path).exists():
-        Path(counter_path).write_text('{"year": 0, "counter": 0}', encoding="utf-8")
+    if not Path(registry_path).exists():
+        Path(registry_path).write_text("{}", encoding="utf-8")
 
 
 def _save_upload_to_tmp(uploaded_file: UploadFile) -> str:
@@ -146,6 +149,47 @@ def month_number_to_column(month_name: str) -> str:
         return month_name
 
 
+def check_month_sequence(
+    selected_month: str,
+    rows: list,
+    year: int,
+    registry_path: str,
+) -> Optional[str]:
+    """Warn if any earlier month has invoiceable clients not yet in the registry."""
+    try:
+        selected_idx = MONTH_NAMES.index(selected_month)
+    except ValueError:
+        return None
+    if selected_idx == 0:
+        return None
+    registry = load_registry(registry_path)
+    year_months = registry.get(str(year), {}).get("months", {})
+    missing = []
+    for i in range(selected_idx):
+        month = MONTH_NAMES[i]
+        if month in year_months:
+            continue
+        col = month_number_to_column(month)
+        has_sessions = any(
+            str(find_field(row, col) or "").strip() not in ("", "0", "0.0", "None")
+            for row in rows
+            if (
+                find_field(row, "Name Surname")
+                or find_field(row, "Client")
+                or find_field(row, "Client Name")
+                or ""
+            ).strip()
+        )
+        if has_sessions:
+            missing.append(month.capitalize())
+    if missing:
+        return (
+            f"Month(s) {', '.join(missing)} have uninvoiced clients — "
+            "generate those first to avoid gaps in invoice numbers."
+        )
+    return None
+
+
 # Improvement 3: check how many invoices already exist for a month
 @app.get("/check-existing")
 def check_existing(month: str = "kovas") -> JSONResponse:
@@ -192,6 +236,14 @@ def preview(
             },
         )
 
+    # Summary/financial row names that must never become invoices
+    _SUMMARY_NAMES = {
+        "sesijų skaičius per mėnesį", "viso", "total", "sum",
+        "uždarbis", "udarbis", "pajamos", "income", "earnings",
+    }
+    from invoice_app.invoice_service import normalize_key as _nk
+    summary_keys = {_nk(s) for s in _SUMMARY_NAMES}
+
     preview_rows = []
     for row in rows:
         name = (
@@ -200,7 +252,7 @@ def preview(
             or find_field(row, "Name Surname")
             or ""
         ).strip()
-        if not name:
+        if not name or _nk(name.rstrip(":;,.")) in summary_keys:
             continue
         sessions_val = find_field(row, month_column) or ""
         rate_val = find_field(row, "Rate") or find_field(row, "Kaina") or ""
@@ -222,6 +274,30 @@ def preview(
         Decimal(r["total"]) for r in preview_rows if r["will_invoice"]
     )
 
+    invoiceable_count = sum(1 for r in preview_rows if r["will_invoice"])
+    no_data_warning = (
+        f"No clients have sessions recorded for {month_column}. "
+        "Check that you selected the correct month and data source."
+        if invoiceable_count == 0 and len(preview_rows) > 0 else None
+    )
+
+    # Propose invoice numbers (read-only — does not write to registry)
+    registry_path = resolve_path("invoice_numbers.json")
+    year = date.today().year
+    invoiceable_names = [r["name"] for r in preview_rows if r["will_invoice"]]
+    inv_numbers = preview_invoice_numbers(
+        month_to_folder(month), invoiceable_names, year,
+        config.invoice_series, registry_path,
+    )
+    for r in preview_rows:
+        info = inv_numbers.get(r["name"])
+        r["invoice_number"] = info["number"] if info else ""
+        r["invoice_locked"] = info["locked"] if info else False
+
+    sequence_warning = check_month_sequence(
+        month_to_folder(month), rows, year, registry_path
+    )
+
     return templates.TemplateResponse(
         "index.html",
         {
@@ -233,7 +309,8 @@ def preview(
             "preview_rows": preview_rows,
             "preview_month": month_column,
             "preview_total": f"{preview_total:.2f}",
-            # Improvement 5: pass tmp path so Generate button can reuse it
+            "no_data_warning": no_data_warning,
+            "sequence_warning": sequence_warning,
             "tmp_csv_path": tmp_csv_path or resolve_path(csv_path),
         },
     )
@@ -283,7 +360,7 @@ async def generate(
         config=config,
         template_path=template_path,
         output_root=resolve_path(config.output_root),
-        counter_file=resolve_path("invoice_counter.json"),
+        registry_file=resolve_path("invoice_numbers.json"),
         policy=policy,
         selected_clients=selected_clients,
         month_folder=month_folder,
@@ -294,6 +371,13 @@ async def generate(
         Path(csv_path).unlink(missing_ok=True)
 
     invoice_folder = str(Path(config.output_root) / month_folder)
+    month_column = month_number_to_column(month)
+
+    no_data_warning = (
+        f"No invoices were generated for {month_column} — no clients have sessions "
+        "recorded for this month. Try selecting a different month or check your data source."
+        if stats["generated"] == 0 and stats["errors"] == 0 else None
+    )
 
     return templates.TemplateResponse(
         "index.html",
@@ -302,9 +386,9 @@ async def generate(
             "months": MONTH_NAMES,
             "policies": ["overwrite", "skip", "version"],
             "stats": stats,
-            # Improvement 4: total_amount from stats
             "total_amount": f"{stats.get('total_amount', Decimal('0')):.2f}",
             "message": "Invoice generation completed",
+            "no_data_warning": no_data_warning,
             "invoice_folder": invoice_folder,
             "invoice_month_folder": month_folder,
             "selected_month": month,
