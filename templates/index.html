@@ -197,13 +197,16 @@
     </div>
 
     <div class="btn-row">
-      <!-- Improvement 2 & 3: spinner + overwrite confirmation -->
+      <!-- Generate: native submit so file input is always included.
+           For overwrite policy we intercept, confirm, then re-click to submit natively. -->
       <button type="submit" class="btn-primary" id="btnGenerate"
               onclick="return handleGenerate(this)">
         Generate Invoices
       </button>
-      <button type="button" class="btn-secondary" id="btnPreview"
-              onclick="handlePreview(this)">
+      <!-- Preview: formaction overrides the form action natively — file input is included. -->
+      <button type="submit" class="btn-secondary" id="btnPreview"
+              formaction="/preview"
+              onclick="showSpinner(this, 'Loading preview…')">
         Preview
       </button>
     </div>
@@ -211,16 +214,21 @@
 </div>
 
 <script>
-  // Improvement 2: show spinner and disable button during submission
   function showSpinner(btn, label) {
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>' + label;
   }
 
-  // Improvement 3: check for existing invoices before overwrite
   function handleGenerate(btn) {
     const month = document.getElementById('month').value;
     const policy = document.getElementById('policy').value;
+
+    // Second pass after async confirmation — submit natively so file input is included.
+    if (btn.dataset.confirmed === '1') {
+      delete btn.dataset.confirmed;
+      showSpinner(btn, 'Generating…');
+      return true;
+    }
 
     if (policy === 'overwrite') {
       fetch('/check-existing?month=' + encodeURIComponent(month))
@@ -231,28 +239,17 @@
               data.count + ' invoice(s) already exist for "' + data.month +
               '".\n\nOverwrite them all?'
             );
-            if (!ok) {
-              btn.disabled = false;
-              return;
-            }
+            if (!ok) return;
           }
-          showSpinner(btn, 'Generating…');
-          document.getElementById('mainForm').submit();
+          // Mark as confirmed and re-click so the form submits natively (file included).
+          btn.dataset.confirmed = '1';
+          btn.click();
         });
-      return false; // prevent immediate submit — async above handles it
+      return false; // block this first click
     }
 
     showSpinner(btn, 'Generating…');
     return true;
-  }
-
-  function handlePreview(btn) {
-    showSpinner(btn, 'Loading preview…');
-    const form = document.getElementById('mainForm');
-    const orig = form.action;
-    form.action = '/preview';
-    form.submit();
-    form.action = orig;
   }
 
   function handleGenerateFromPreview(btn) {

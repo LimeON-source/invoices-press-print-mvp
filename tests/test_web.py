@@ -214,11 +214,19 @@ def test_generate_button_has_onclick_handler():
     assert response.status_code == 200
     assert "handleGenerate" in response.text
 
-
-def test_preview_button_has_onclick_handler():
+def test_generate_button_confirmed_flag_pattern():
+    """Generate must use data-confirmed pattern (not form.submit) to preserve file inputs."""
     response = client.get("/")
     assert response.status_code == 200
-    assert "handlePreview" in response.text
+    assert "btn.dataset.confirmed" in response.text
+    assert "btn.click()" in response.text
+
+
+def test_preview_button_uses_formaction():
+    """Preview button must use formaction=/preview so file inputs are included natively."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert 'formaction="/preview"' in response.text
 
 
 def test_spinner_css_present():
@@ -246,6 +254,57 @@ def test_month_number_to_column():
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
+
+def test_generate_uploaded_file_takes_priority_over_path():
+    """Uploaded file must be used instead of the csv_path when both are provided."""
+    import io
+    # CSV with a unique client that cannot exist in the default xlsx
+    csv_content = b"Client,Kovas,Rate,Address\nUNIQUE_UPLOAD_CLIENT,3,99,City\n"
+
+    captured = {}
+    orig_load = __import__("invoice_app.web", fromlist=["_load_rows"])._load_rows
+
+    def spy(csv_path, uploaded_file=None):
+        rows = orig_load(csv_path, uploaded_file)
+        captured["rows"] = rows
+        return rows
+
+    with patch("invoice_app.web._load_rows", side_effect=spy), \
+         patch("invoice_app.web.process_batch", return_value=DUMMY_STATS), \
+         patch("invoice_app.web.load_config") as mock_cfg:
+        mock_cfg.return_value = MagicMock(output_root="Invoices", seller=MagicMock())
+        client.post(
+            "/generate",
+            data={
+                "month": "kovas",
+                "csv_path": "Context/Psichoterapijos apskaita.xlsx",
+                "template_path": "Context/template saskaita-faktura.docx",
+                "policy": "skip",
+            },
+            files={"uploaded_file": ("test.csv", io.BytesIO(csv_content), "text/csv")},
+        )
+
+    assert captured.get("rows") is not None
+    names = [r.get("Client", "") for r in captured["rows"]]
+    assert "UNIQUE_UPLOAD_CLIENT" in names, "Uploaded file was not used — default path was used instead"
+
+
+def test_preview_uploaded_file_takes_priority_over_path():
+    """Preview must use uploaded file, not the csv_path."""
+    import io
+    csv_content = b"Client,Kovas,Rate,Address\nPREVIEW_UPLOAD_CLIENT,4,50,City\n"
+
+    with patch("invoice_app.web.load_config") as mock_cfg:
+        mock_cfg.return_value = MagicMock(output_root="Invoices")
+        response = client.post(
+            "/preview",
+            data={"month": "kovas", "csv_path": "Context/Psichoterapijos apskaita.xlsx"},
+            files={"uploaded_file": ("clients.csv", io.BytesIO(csv_content), "text/csv")},
+        )
+
+    assert response.status_code == 200
+    assert "PREVIEW_UPLOAD_CLIENT" in response.text
+
 
 def test_generate_bad_data_source_shows_error():
     with patch("invoice_app.web._load_rows", side_effect=FileNotFoundError("not found")), \
